@@ -456,6 +456,13 @@ impl SubscriptionVault {
             (Symbol::new(&env, "emergency_stop_enabled"),),
             EmergencyStopEnabledEvent {
                 admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
     /// **ADMIN ONLY**: Export contract-level configuration for migration tooling.
     ///
     /// Read-only snapshot intended for carefully managed upgrades.
@@ -539,6 +546,33 @@ impl SubscriptionVault {
             (Symbol::new(&env, "emergency_stop_disabled"),),
             EmergencyStopDisabledEvent {
                 admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// **ADMIN ONLY**: Export a single subscription summary for migration tooling.
+    pub fn export_subscription_summary(
+        env: Env,
+        admin: Address,
+        subscription_id: u32,
+    ) -> Result<SubscriptionSummary, Error> {
+        require_admin_auth(&env, &admin)?;
+        let sub = queries::get_subscription(&env, subscription_id)?;
+
+        env.events().publish(
+            (Symbol::new(&env, "migration_export"),),
+            MigrationExportEvent {
+                admin: admin.clone(),
+                start_id: subscription_id,
+                limit: 1,
+                exported: 1,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
         Ok(SubscriptionSummary {
             subscription_id,
             subscriber: sub.subscriber,
