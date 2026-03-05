@@ -1,4 +1,4 @@
-//! Subscription lifecycle: create, deposit.
+//! Subscription lifecycle: create, deposit, cancel, pause, resume, withdraw.
 //!
 //! See `docs/subscription_lifecycle.md` for the full lifecycle and state machine.
 //!
@@ -10,7 +10,7 @@ use crate::queries::get_subscription;
 use crate::safe_math::{safe_add_balance, validate_non_negative};
 use crate::state_machine::validate_status_transition;
 use crate::types::{DataKey, Error, PlanTemplate, Subscription, SubscriptionStatus};
-use soroban_sdk::{Address, Env, Symbol, Vec};
+use soroban_sdk::{symbol_short, Address, Env, Symbol, Vec};
 
 pub fn next_id(env: &Env) -> u32 {
     let key = Symbol::new(env, "next_id");
@@ -39,9 +39,18 @@ pub fn do_create_subscription(
     amount: i128,
     interval_seconds: u64,
     usage_enabled: bool,
+    lifetime_cap: Option<i128>,
 ) -> Result<u32, Error> {
     subscriber.require_auth();
     validate_non_negative(amount)?;
+
+    // Validate lifetime_cap if provided
+    if let Some(cap) = lifetime_cap {
+        if cap <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+    }
+
     let sub = Subscription {
         subscriber: subscriber.clone(),
         merchant: merchant.clone(),
@@ -51,15 +60,40 @@ pub fn do_create_subscription(
         status: SubscriptionStatus::Active,
         prepaid_balance: 0i128,
         usage_enabled,
+        lifetime_cap,
+        lifetime_charged: 0i128,
     };
-    let id = next_id(env);
+
+    // Allocate ID with overflow / limit guard.
+    let key = Symbol::new(env, "next_id");
+    let id: u32 = env.storage().instance().get(&key).unwrap_or(0);
+    if id == crate::MAX_SUBSCRIPTION_ID {
+        return Err(Error::SubscriptionLimitReached);
+    }
+    env.storage().instance().set(&key, &(id + 1));
+
     env.storage().instance().set(&id, &sub);
 
     // Maintain merchant → subscription-ID index
-    let key = DataKey::MerchantSubs(sub.merchant.clone());
-    let mut ids: Vec<u32> = env.storage().instance().get(&key).unwrap_or(Vec::new(env));
+    let merchant_key = DataKey::MerchantSubs(sub.merchant.clone());
+    let mut ids: Vec<u32> = env
+        .storage()
+        .instance()
+        .get(&merchant_key)
+        .unwrap_or(Vec::new(env));
     ids.push_back(id);
-    env.storage().instance().set(&key, &ids);
+    env.storage().instance().set(&merchant_key, &ids);
+
+    env.events().publish(
+        (symbol_short!("created"), id),
+        (
+            subscriber.clone(),
+            merchant.clone(),
+            amount,
+            interval_seconds,
+            lifetime_cap,
+        ),
+    );
 
     Ok(id)
 }
@@ -80,6 +114,7 @@ pub fn do_deposit_funds(
 
     let mut sub = get_subscription(env, subscription_id)?;
     sub.prepaid_balance = safe_add_balance(sub.prepaid_balance, amount)?;
+
     let token_addr: Address = env
         .storage()
         .instance()
@@ -147,8 +182,11 @@ pub fn do_resume_subscription(
 }
 
 /// Merchant-initiated one-off charge: debits `amount` from the subscription's prepaid balance.
-/// Requires merchant auth; the subscription's merchant must match the caller. Subscription must be
-/// Active or Paused. Amount must be positive and not exceed prepaid_balance.
+///
+/// Requires merchant auth; the subscription's merchant must match the caller.
+/// Subscription must be Active or Paused. Amount must be positive and not exceed prepaid_balance.
+///
+/// One-off charges also count toward the lifetime cap when one is configured.
 pub fn do_charge_one_off(
     env: &Env,
     subscription_id: u32,
@@ -171,13 +209,24 @@ pub fn do_charge_one_off(
         return Err(Error::InsufficientPrepaidBalance);
     }
 
+    // Enforce lifetime cap for one-off charges
+    if let Some(cap) = sub.lifetime_cap {
+        let new_charged = sub
+            .lifetime_charged
+            .checked_add(amount)
+            .ok_or(Error::Overflow)?;
+        if new_charged > cap {
+            return Err(Error::LifetimeCapReached);
+        }
+        sub.lifetime_charged = new_charged;
+    }
+
     sub.prepaid_balance = sub
         .prepaid_balance
         .checked_sub(amount)
         .ok_or(Error::Overflow)?;
 
     env.storage().instance().set(&subscription_id, &sub);
-
     Ok(())
 }
 
@@ -195,7 +244,7 @@ pub fn do_withdraw_subscriber_funds(
     }
 
     if sub.status != SubscriptionStatus::Cancelled {
-        return Err(Error::InvalidStatusTransition); // Or Unauthorized/InvalidState
+        return Err(Error::InvalidStatusTransition);
     }
 
     let amount_to_refund = sub.prepaid_balance;
@@ -226,14 +275,23 @@ pub fn do_create_plan_template(
     amount: i128,
     interval_seconds: u64,
     usage_enabled: bool,
+    lifetime_cap: Option<i128>,
 ) -> Result<u32, Error> {
     merchant.require_auth();
+
+    // Validate lifetime_cap if provided
+    if let Some(cap) = lifetime_cap {
+        if cap <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+    }
 
     let plan = PlanTemplate {
         merchant,
         amount,
         interval_seconds,
         usage_enabled,
+        lifetime_cap,
     };
 
     let plan_id = next_plan_id(env);
@@ -252,18 +310,34 @@ pub fn do_create_subscription_from_plan(
 
     let plan = get_plan_template(env, plan_template_id)?;
 
+    let key = Symbol::new(env, "next_id");
+    let id: u32 = env.storage().instance().get(&key).unwrap_or(0);
+    env.storage().instance().set(&key, &(id + 1));
+
     let sub = Subscription {
         subscriber: subscriber.clone(),
-        merchant: plan.merchant,
+        merchant: plan.merchant.clone(),
         amount: plan.amount,
         interval_seconds: plan.interval_seconds,
         last_payment_timestamp: env.ledger().timestamp(),
         status: SubscriptionStatus::Active,
         prepaid_balance: 0i128,
         usage_enabled: plan.usage_enabled,
+        lifetime_cap: plan.lifetime_cap,
+        lifetime_charged: 0i128,
     };
 
-    let id = next_id(env);
     env.storage().instance().set(&id, &sub);
+
+    // Maintain merchant → subscription-ID index
+    let merchant_key = DataKey::MerchantSubs(plan.merchant.clone());
+    let mut ids: Vec<u32> = env
+        .storage()
+        .instance()
+        .get(&merchant_key)
+        .unwrap_or(Vec::new(env));
+    ids.push_back(id);
+    env.storage().instance().set(&merchant_key, &ids);
+
     Ok(id)
 }
