@@ -29,6 +29,9 @@ pub enum DataKey {
     IdemKey(u32),
     /// Emergency stop flag - when true, critical operations are blocked. Discriminant 9.
     EmergencyStop,
+    BillingStatement(u32, u32),
+    BillingStatementsBySubscription(u32),
+    BillingStatementsByMerchant(Address),
 }
 
 /// Detailed error information for insufficient balance scenarios.
@@ -166,7 +169,6 @@ impl Error {
     }
 }
 
-/// Result of charging one subscription in a batch.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct BatchChargeResult {
